@@ -1,81 +1,128 @@
-// Blind relay: stores only hashed IDs, public keys and opaque ciphertext.
 const express = require('express');
 const http = require('http');
 const path = require('path');
+const crypto = require('crypto');
+const { promisify } = require('util');
 const { WebSocketServer } = require('ws');
 const Database = require('better-sqlite3');
+const sms = require('./smsService');
 
-const db = new Database(path.join(__dirname, 'relay.db'));
+const pbkdf2 = promisify(crypto.pbkdf2);
+const SECRET = process.env.JWT_SECRET || (console.warn('JWT_SECRET not set: using a random one (sessions reset on restart)'), crypto.randomBytes(32).toString('hex'));
+const PHONE_SALT = 'anon-e2ee-messenger/phone-salt/v1'; // must match public/crypto.js
+const OTP_TTL = 5 * 60 * 1000;
+
+// ---- Storage: only hashes, public keys, ciphertext ----
+const db = new Database(process.env.DB_FILE || path.join(__dirname, 'relay.db'));
 db.exec(`
 CREATE TABLE IF NOT EXISTS users(phoneHash TEXT PRIMARY KEY, publicKeyJwk TEXT);
-CREATE TABLE IF NOT EXISTS queue(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  toPhoneHash TEXT, fromPhoneHash TEXT, kind TEXT,
-  iv TEXT, ciphertext TEXT, timestamp INTEGER);`);
+CREATE TABLE IF NOT EXISTS queue(id INTEGER PRIMARY KEY AUTOINCREMENT, toHash TEXT, fromHash TEXT, type TEXT, iv TEXT, data TEXT, ts INTEGER);`);
+const otps = new Map(); // phoneHash -> { otpHash, expiresAt, attempts, lastSent }  (RAM only)
 
-const app = express();
-app.use(express.json({ limit: '64kb' }));
-app.use(express.static(path.join(__dirname, 'public')));
-
-const online = new Map(); // phoneHash -> ws
 const logs = [];
 const log = (s) => { logs.push(`[${new Date().toISOString().slice(11, 19)}] ${s}`); if (logs.length > 80) logs.shift(); console.log(s); };
 const short = (h) => (h || '').slice(0, 8) + '…';
-const okHash = (h) => typeof h === 'string' && h.length > 20 && h.length < 100;
+const normPhone = (p) => String(p || '').replace(/[^\d+]/g, '');
+const hashPhone = async (p) => (await pbkdf2(p, PHONE_SALT, 100000, 32, 'sha256')).toString('base64');
+const hashOtp = (otp, ph) => crypto.createHash('sha256').update(otp + ':' + ph).digest('hex');
 
-app.post('/api/register', (req, res) => {
-  const { phoneHash, publicKeyJwk } = req.body || {};
-  if (!okHash(phoneHash) || !publicKeyJwk) return res.status(400).json({ error: 'bad request' });
-  db.prepare('INSERT OR REPLACE INTO users VALUES (?,?)').run(phoneHash, JSON.stringify(publicKeyJwk));
-  log(`REGISTER ${short(phoneHash)} pubkey.x=${short(publicKeyJwk.x)}`);
+// ---- Minimal HS256 JWT (no dependency) ----
+const sign = (payload) => {
+  const h = Buffer.from('{"alg":"HS256","typ":"JWT"}').toString('base64url'), b = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  return `${h}.${b}.${crypto.createHmac('sha256', SECRET).update(`${h}.${b}`).digest('base64url')}`;
+};
+const verifyJwt = (t) => {
+  try {
+    const [h, b, s] = String(t).split('.');
+    const e = crypto.createHmac('sha256', SECRET).update(`${h}.${b}`).digest('base64url');
+    if (s.length !== e.length || !crypto.timingSafeEqual(Buffer.from(s), Buffer.from(e))) return null;
+    const p = JSON.parse(Buffer.from(b, 'base64url'));
+    return p.exp > Date.now() / 1000 ? p : null;
+  } catch { return null; }
+};
+const auth = (req, res, next) => {
+  const p = verifyJwt((req.headers.authorization || '').replace('Bearer ', ''));
+  if (!p) return res.status(401).json({ error: 'unauthorized' });
+  req.hash = p.sub; next();
+};
+
+const app = express();
+app.use(express.json({ limit: '32kb' }));
+app.use(express.static(path.join(__dirname, 'public')));
+app.get('/api/config', (_req, res) => res.json({ sms: sms.provider, simulated: sms.simulated }));
+
+// ---- OTP login ----
+app.post('/api/auth/request-otp', async (req, res) => {
+  const phone = normPhone(req.body?.phone);
+  if (phone.length < 8 || phone.length > 16) return res.status(400).json({ error: 'invalid phone' });
+  const ph = await hashPhone(phone);
+  const prev = otps.get(ph);
+  if (prev && Date.now() - prev.lastSent < 30000) return res.status(429).json({ error: 'wait 30s before requesting another code' });
+  const otp = String(crypto.randomInt(100000, 1000000));
+  try { await sms.send(phone, ph, otp); } catch (e) { log('SMS failed: ' + e.message); return res.status(502).json({ error: 'sms failed' }); }
+  otps.set(ph, { otpHash: hashOtp(otp, ph), expiresAt: Date.now() + OTP_TTL, attempts: 0, lastSent: Date.now() });
+  log(`OTP issued for ${short(ph)} (phone discarded)`);
   res.json({ ok: true });
 });
 
-app.get('/api/key/:hash', (req, res) => {
+app.post('/api/auth/verify-otp', async (req, res) => {
+  const ph = await hashPhone(normPhone(req.body?.phone));
+  const rec = otps.get(ph), otp = String(req.body?.otp || '');
+  if (!rec || rec.expiresAt < Date.now() || ++rec.attempts > 5) { otps.delete(ph); return res.status(401).json({ error: 'code expired or too many attempts' }); }
+  const a = Buffer.from(hashOtp(otp, ph)), b = Buffer.from(rec.otpHash);
+  if (!crypto.timingSafeEqual(a, b)) return res.status(401).json({ error: 'wrong code' });
+  otps.delete(ph);
+  log(`LOGIN ${short(ph)}`);
+  res.json({ token: sign({ sub: ph, exp: Math.floor(Date.now() / 1000) + 7 * 86400 }) });
+});
+
+// ---- Key directory ----
+app.post('/api/keys', auth, (req, res) => {
+  if (!req.body?.publicKeyJwk) return res.status(400).end();
+  db.prepare('INSERT OR REPLACE INTO users VALUES (?,?)').run(req.hash, JSON.stringify(req.body.publicKeyJwk));
+  log(`PUBKEY ${short(req.hash)}`); res.json({ ok: true });
+});
+app.get('/api/key/:hash', auth, (req, res) => {
   const row = db.prepare('SELECT publicKeyJwk FROM users WHERE phoneHash=?').get(req.params.hash);
-  if (!row) return res.status(404).json({ error: 'not found' });
-  res.json({ publicKeyJwk: JSON.parse(row.publicKeyJwk) });
+  row ? res.json({ publicKeyJwk: JSON.parse(row.publicKeyJwk) }) : res.status(404).json({ error: 'not found' });
 });
 
-// Server Inspector: exactly what the server can see.
-app.get('/api/inspect', (_req, res) => {
-  res.json({
-    users: db.prepare('SELECT phoneHash, publicKeyJwk FROM users').all().map(u => ({ phoneHash: u.phoneHash, pubX: JSON.parse(u.publicKeyJwk).x })),
-    queue: db.prepare('SELECT * FROM queue ORDER BY id DESC LIMIT 20').all(),
-    online: [...online.keys()],
-    log: logs.slice(-40),
-  });
-});
+// ---- Demo tools ----
+app.get('/api/sim-sms/:hash', (req, res) => sms.simulated ? res.json(sms.inbox.get(req.params.hash) || []) : res.status(404).end());
+app.get('/api/inspect', (_req, res) => res.json({
+  users: db.prepare('SELECT phoneHash FROM users').all().map((u) => u.phoneHash),
+  online: [...online.keys()],
+  pendingOtps: [...otps].map(([k, v]) => ({ phoneHash: k, otpHash: v.otpHash.slice(0, 16) + '…', expiresInSec: Math.max(0, Math.round((v.expiresAt - Date.now()) / 1000)) })),
+  queue: db.prepare('SELECT * FROM queue ORDER BY id DESC LIMIT 15').all(),
+  log: logs.slice(-40),
+}));
 
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
-
-function deliver(row) {
-  const ws = online.get(row.toPhoneHash);
-  if (!ws || ws.readyState !== 1) return false;
-  ws.send(JSON.stringify({ t: 'msg', from: row.fromPhoneHash, kind: row.kind, iv: row.iv, ct: row.ciphertext, ts: row.timestamp }));
-  db.prepare('DELETE FROM queue WHERE id=?').run(row.id); // delete immediately after delivery
-  log(`DELIVERED+DELETED ${row.kind} ${short(row.fromPhoneHash)} → ${short(row.toPhoneHash)}`);
-  return true;
+// ---- Blind relay over WebSocket: envelope { to, from, type, iv, data } ----
+const online = new Map();
+function deliver(r) {
+  const ws = online.get(r.toHash);
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({ to: r.toHash, from: r.fromHash, type: r.type, iv: r.iv, data: r.data, ts: r.ts }));
+  db.prepare('DELETE FROM queue WHERE id=?').run(r.id);
+  log(`DELIVERED+DELETED ${r.type} ${short(r.fromHash)} → ${short(r.toHash)}`);
 }
-
-wss.on('connection', (ws) => {
-  ws.on('message', (data) => {
-    let m; try { m = JSON.parse(data); } catch { return; }
-    if (m.t === 'auth' && okHash(m.phoneHash)) {
-      ws.hash = m.phoneHash; online.set(m.phoneHash, ws);
-      log(`ONLINE ${short(m.phoneHash)}`);
-      for (const row of db.prepare('SELECT * FROM queue WHERE toPhoneHash=? ORDER BY id').all(m.phoneHash)) deliver(row);
-    } else if (m.t === 'send' && ws.hash && okHash(m.to) && ['hs', 'ack', 'msg'].includes(m.kind)) {
-      const ts = Date.now();
-      const info = db.prepare('INSERT INTO queue(toPhoneHash,fromPhoneHash,kind,iv,ciphertext,timestamp) VALUES (?,?,?,?,?,?)')
-        .run(m.to, ws.hash, m.kind, String(m.iv || ''), String(m.ct || ''), ts);
-      log(`RELAY ${m.kind} ${short(ws.hash)} → ${short(m.to)} iv=${String(m.iv || '').slice(0, 10)}… ct=${String(m.ct || '').slice(0, 24)}…`);
-      deliver({ id: info.lastInsertRowid, toPhoneHash: m.to, fromPhoneHash: ws.hash, kind: m.kind, iv: m.iv || '', ciphertext: m.ct || '', timestamp: ts });
+const server = http.createServer(app);
+new WebSocketServer({ server }).on('connection', (ws) => {
+  ws.on('message', (raw) => {
+    let m; try { m = JSON.parse(raw); } catch { return; }
+    if (m.type === 'auth') {
+      const p = verifyJwt(m.token); if (!p) return ws.close();
+      ws.hash = p.sub; online.set(ws.hash, ws); log(`ONLINE ${short(ws.hash)}`);
+      db.prepare('SELECT * FROM queue WHERE toHash=? ORDER BY id').all(ws.hash).forEach((r) => deliver({ ...r }));
+    } else if (ws.hash && typeof m.to === 'string' && ['hs', 'ack', 'msg'].includes(m.type)) {
+      const ts = Date.now(), iv = String(m.iv || ''), data = String(m.data || '');
+      if (data.length > 20000) return;
+      const id = db.prepare('INSERT INTO queue(toHash,fromHash,type,iv,data,ts) VALUES (?,?,?,?,?,?)').run(m.to, ws.hash, m.type, iv, data, ts).lastInsertRowid;
+      log(`RELAY ${m.type} ${short(ws.hash)} → ${short(m.to)} data=${data.slice(0, 24)}…`); // "from" is always set by the server
+      deliver({ id, toHash: m.to, fromHash: ws.hash, type: m.type, iv, data, ts });
     }
   });
   ws.on('close', () => { if (ws.hash && online.get(ws.hash) === ws) { online.delete(ws.hash); log(`OFFLINE ${short(ws.hash)}`); } });
 });
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Messenger running at http://localhost:${PORT}`));
+server.listen(process.env.PORT || 3000, () => console.log(`Running on :${process.env.PORT || 3000} (SMS provider: ${sms.provider})`));
