@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Anon E2EE Messenger</title>
+<style>
+:root{--bg:#10141a;--panel:#171d26;--line:#263040;--text:#e6ebf2;--dim:#8794a8;--acc:#5ee1c0;--me:#1f4a43;--them:#222b38;--bad:#ff7b7b}
+*{box-sizing:border-box}
+body{margin:0;height:100vh;background:var(--bg);color:var(--text);font:15px/1.45 "Segoe UI",system-ui,sans-serif}
+.hidden{display:none!important}
+input,button{font:inherit;color:inherit}
+input{background:#0d1117;border:1px solid var(--line);border-radius:6px;padding:9px 10px;width:100%}
+input:focus,button:focus-visible{outline:2px solid var(--acc);outline-offset:1px}
+button{background:var(--acc);color:#06201a;border:0;border-radius:6px;padding:9px 14px;font-weight:600;cursor:pointer}
+button.ghost{background:transparent;color:var(--text);border:1px solid var(--line)}
+#auth{height:100%;display:grid;place-items:center}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:26px;width:min(380px,92vw);display:grid;gap:12px}
+.card h1{margin:0;font-size:20px}.dim{color:var(--dim);font-size:13px}.err{color:var(--bad);font-size:13px;min-height:18px}
+#app{height:100%;display:grid;grid-template-columns:270px 1fr auto}
+#side{border-right:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;padding:14px;gap:10px;min-height:0}
+#contacts{overflow:auto;flex:1;display:grid;gap:4px;align-content:start}
+.ct{padding:9px 10px;border-radius:6px;cursor:pointer}.ct:hover,.ct.on{background:#232d3b}
+#main{display:flex;flex-direction:column;min-width:0;min-height:0}
+#head{padding:14px 18px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center}
+#msgs{flex:1;overflow:auto;padding:18px;display:flex;flex-direction:column;gap:8px}
+.b{max-width:70%;padding:8px 12px;border-radius:10px;background:var(--them);word-wrap:break-word}
+.b.me{align-self:flex-end;background:var(--me)}.b small{display:block;color:var(--dim);font-size:11px}
+#form{display:flex;gap:8px;padding:12px;border-top:1px solid var(--line)}
+#insp{width:420px;border-left:1px solid var(--line);background:#0b0f14;padding:12px;overflow:auto;font:12px/1.4 ui-monospace,Consolas,monospace}
+#insp h3{margin:10px 0 4px;font:600 13px "Segoe UI",sans-serif;color:var(--acc)}
+#insp pre{white-space:pre-wrap;word-break:break-all;margin:0;color:#b8c4d6}
+#modal{position:fixed;inset:0;background:#000a;display:grid;place-items:center}
+.otp{font:700 34px ui-monospace,Consolas,monospace;letter-spacing:6px;color:var(--acc);text-align:center}
+@media(max-width:800px){#app{grid-template-columns:1fr}#side{border-right:0;border-bottom:1px solid var(--line)}#insp{width:auto}}
+</style>
+</head>
+<body>
+<div id="auth">
+  <div class="card">
+    <h1>Anonymous vault</h1>
+    <p class="dim" id="authhint">Your keys and chats are encrypted on this device with your PIN. The server only sees a hash of your phone number.</p>
+    <input id="alias" placeholder="Alias (stays on this device)">
+    <input id="phone" placeholder="Phone number (used only to be found)" inputmode="tel">
+    <input id="pin" type="password" placeholder="Vault PIN">
+    <div class="err" id="authmsg"></div>
+    <button id="go">Create vault</button>
+  </div>
+</div>
+
+<div id="app" class="hidden">
+  <aside id="side">
+    <div><strong id="me"></strong><div class="dim" id="myhash"></div></div>
+    <input id="newphone" placeholder="Contact's phone number" inputmode="tel">
+    <button id="newbtn">Start verified chat</button>
+    <div id="contacts"></div>
+    <button class="ghost" id="inspbtn">Server inspector</button>
+  </aside>
+  <section id="main">
+    <div id="head"><strong id="peer">No chat selected</strong><span class="dim" id="status"></span></div>
+    <div id="msgs"><p class="dim">Verify a contact to start an encrypted conversation.</p></div>
+    <form id="form" class="hidden"><input id="text" placeholder="Write a message" autocomplete="off"><button>Send</button></form>
+  </section>
+  <aside id="insp" class="hidden"></aside>
+</div>
+
+<div id="modal" class="hidden">
+  <div class="card">
+    <h1 id="mtitle">Verify contact</h1>
+    <div class="dim">Your code, read it to your contact:</div>
+    <div class="otp" id="motp"></div>
+    <div class="dim" id="mcount"></div>
+    <input id="mname" placeholder="Name for this contact">
+    <input id="mtheir" placeholder="Their 6-digit code" inputmode="numeric" maxlength="6">
+    <input id="mown" placeholder="Re-enter your own code to confirm" inputmode="numeric" maxlength="6">
+    <div class="err" id="mstat"></div>
+    <div style="display:flex;gap:8px"><button id="mok">Verify</button><button class="ghost" id="mcancel">Cancel</button></div>
+  </div>
+</div>
+
+<script src="crypto.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
